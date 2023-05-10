@@ -1,0 +1,225 @@
+
+library(tidyverse)
+library(tidyselect)
+library(ggplot2)
+library(raster)
+library(sp)
+library(rgeos)
+library(sf)
+library(geosphere)
+
+# World map
+library(rnaturalearth)
+worldmap <- ne_countries(scale = "medium", type = "countries", returnclass = "sf")[1]
+
+
+sp.focal_name <- c("Anopheles_gambiae", "Anopheles_funestus", "Aedes_albopictus", "Aedes_aegypti", "Culex_pipiens", "Culex_quinquefasciatus")
+
+# Load blood meal data file
+setwd(dir.stem)
+D.blm <- read.csv("Blood.meal_data 230118.csv", header=T)
+
+
+D.blm <- as_tibble(D.blm)
+
+# Vector of study ID
+study_ID <-  sort(unique(D.blm$study_ID))
+# Number of studies
+n_study <- length(study_ID)
+
+# Check if >1 unique lat_1
+study_nlat1 <- D.blm %>%
+  group_by(study_ID) %>%
+  summarize(n_lat_1 = length(unique(lat_1, na.rm = TRUE)))
+
+# Check if multiple regions are mentioned with same coordinates
+study_nreg.coord <- D.blm %>%
+  group_by(region) %>%
+  summarize(n_lat_1 = length(unique(lat_1, na.rm = TRUE)))
+D.blm$region[which(study_nreg.coord$n_lat_1>1)]
+D.blm$study_ID[which(study_nreg.coord$n_lat_1>1)]
+
+# Generate a vector of unique sites (some studies include multiple sites given as unique lat_1/Long_1 coordinates)
+D.blm$site <- paste(D.blm$study_ID, D.blm$lat_1, D.blm$long_1, sep="_")
+D.blm$site_ID <- paste(D.blm$study_ID, as.numeric(as.factor(D.blm$site)), sep="_")
+
+n_site <- length(unique(D.blm$site_ID))
+
+# Compute average/centroid of (multiple) coordinates
+D.blm$lat <- rowMeans(D.blm[ , names(D.blm)[grep("lat_", names(D.blm))]], na.rm=T) 
+D.blm$long <- rowMeans(D.blm[ , names(D.blm)[grep("long_", names(D.blm))]], na.rm=T) 
+
+
+Df.blm <- filter(D.blm, species_rev %in% sp.focal_name)
+sort(which(table(paste(Df.blm$site_ID, Df.blm$species_rev, sep="_"))>1))
+
+
+#########
+# Data table of site-level attributes
+D.site <- distinct(D.blm[ , c("study_ID", "site_ID", "lat", "long", "country")])
+
+# Plot location of all sites
+ggplot(worldmap) + geom_sf() +
+  geom_point(data = D.site, aes(x = long, y = lat), size = 2, shape = 19, col = "darkred")
+
+# Number of points
+NPoints <- dim(D.site)[1]
+# Spatial points
+sp.pts <- sf::st_multipoint(matrix(c(D.site$long,D.site$lat), length(D.site$long), 2))
+# Buffer around sample locations
+buff10.pts <- st_buffer(sp.pts, dist=10/111)
+
+
+######
+# Worldclim data
+rast_worldclim <- raster::getData("worldclim",var="bio",res=10)
+rast_worldclim <- rast_worldclim[[c("bio1", "bio12", "bio14", "bio15")]]
+sp.pts <- SpatialPoints(data.frame(D.site$long, D.site$lat), proj4string = rast_worldclim@crs)
+worldclim.values <- raster::extract(rast_worldclim, sp.pts)  
+D.site$bio1 <- worldclim.values[, "bio1"]
+D.site$bio12 <- worldclim.values[, "bio12"]
+D.site$bio14 <- worldclim.values[, "bio14"]
+D.site$bio15 <- worldclim.values[, "bio15"]
+
+
+######
+# Elevation data
+
+D.site$elevation <- rep(NA, NPoints)
+elevation_world <- getData('worldclim', var='alt', res=2.5)
+D.site$elevation <- raster::extract(elevation_world, sp.pts)
+D.site$elevation <- ifelse(D.site$elevation<1,1,D.site$elevation)
+
+######
+# Copernicus landcover data
+
+## LCCS data and codes can be downloaded here:  
+# https://cds.climate.copernicus.eu/cdsapp#!/dataset/satellite-land-cover?tab=form  
+# https://maps.elie.ucl.ac.be/CCI/viewer/download/CCI-LC_Maps_Legend.pdf
+
+
+setwd(dir.copernicus)
+Copernicus <- raster("ESACCI-LC-L4-LCCS-Map-300m-P1Y-2010-v2.0.7cds.nc")
+
+coord <- D.site
+coordinates(coord) <- ~long + lat
+proj4string(coord) <- crs(Copernicus)
+coord_vals <- raster::extract(Copernicus, coord, buffer = 10000)
+D.site$prop_cropland <- rep(NA, NPoints)
+D.site$prop_water <- rep(NA, NPoints)
+D.site$prop_urban <- rep(NA, NPoints)
+D.site$prop_grassland <- rep(NA, NPoints)
+D.site$prop_treecover <- rep(NA, NPoints)
+D.site$prop_shrubland <- rep(NA, NPoints)
+for(p in 1:NPoints){
+  coord_vals <- raster::extract(Copernicus, coord[p,], buffer = 10000)
+  coord_vals <- unlist(coord_vals)
+  D.site$prop_cropland[p] <- length(which(coord_vals %in% c(10, 20, 30))) / length(coord_vals)
+  D.site$prop_water[p] <- length(which(coord_vals == 210)) / length(coord_vals)
+  D.site$prop_urban[p] <- length(which(coord_vals == 190)) / length(coord_vals)
+  D.site$prop_grassland[p] <- length(which(coord_vals == 130)) / length(coord_vals)
+  D.site$prop_shrubland[p] <- length(which(coord_vals %in% c(120, 121, 122))) / length(coord_vals)
+  D.site$prop_treecover[p] <- length(which(coord_vals %in% c(40, 50, 60, 61, 62, 71, 72, 80, 81, 82, 90))) / length(coord_vals)
+}
+
+
+###############
+# Map of zoogeographical regions/realms can be downloaded here: https://macroecology.ku.dk/resources/wallace
+
+setwd(dir.zooreg)
+poly_Realms <- st_read("newRealms.shp")
+pts.multi_all <- sf::st_multipoint(as.matrix(data.frame(D.site$long, D.site$lat)))
+pts <- st_cast(st_sfc(pts.multi_all), "POINT")
+st_crs(pts) <- st_crs(poly_Realms)
+
+# Correct wrong spelling in realm name "Oceania"
+poly_Realms$Realm[which(poly_Realms$Realm=="Oceanina")] <- "Oceania"
+realm_name <- unique(poly_Realms$Realm)
+nrealm <- length(realm_name)
+
+D.site$realm <- rep(NA, NPoints)
+for(r in 1:nrealm){
+  sf_use_s2(FALSE)
+  polyrealm <- poly_Realms %>% filter (Realm==realm_name[r])
+  polyrealm <-  polyrealm[1]
+  st_intersection(pts, polyrealm)
+  D.site$realm[which(st_intersects(pts, polyrealm, sparse = FALSE))] <- realm_name[r]
+}
+
+
+###############
+# NDVI data from MODIS
+
+
+library(MODISTools)
+D.site$NDVI.mean <- rep(NA< NPoints)
+D.site$NDVI.SD <- rep(NA< NPoints)
+
+# Run multiple loops if download interrupts
+for(x in 1:(NPoints*10000)){
+  i <- which(is.na(D.site$NDVI.mean))[1]
+  if(!is.na(i)){
+    tryCatch(point_ndvi <- mt_subset(product = "MOD13Q1",
+                                     lat = D.site$lat[i],
+                                     lon =  D.site$long[i],
+                                     band = "250m_16_days_NDVI",
+                                     start = "2010-01-01",
+                                     end = "2010-12-30",
+                                     km_lr = 10,
+                                     km_ab = 10,
+                                     site_name = "i",
+                                     internal = TRUE,
+                                     progress = FALSE), finally = print("Hello"), error = function(e) { skip_to_next <<- TRUE})
+    if(exists("point_ndvi")){
+      D.site$NDVI.mean[i] <- round(mean(point_ndvi$value, na.rm=T))
+      D.site$NDVI.SD[i] <- round(sd(point_ndvi$value))
+      print(paste("datpoint:", i, "   loop:", x))
+    }else{}
+  }else{}
+  rm(point_ndvi)
+  if(i==NPoints){break}else{}
+}
+
+
+################################
+
+###############
+# Global livestock data GLW3 (https://www.livestockdata.org/contributor/gridded-livestock-world-glw3)
+#
+setwd(dir.glw3)
+buffalo <- raster("5_Bf_2010_Da.tif")
+cattle <- raster("5_Ct_2010_Da.tif")
+chicken <- raster("5_Ch_2010_Da.tif")
+duck <- raster("5_Dk_2010_Da.tif")
+horse <- raster("5_Ho_2010_Da.tif")
+goat <- raster("5_Gt_2010_Da.tif")
+pig <- raster("5_Pg_2010_Da.tif")
+sheep <- raster("5_Sh_2010_Da.tif")
+
+D.site$glw3_buffalo <- raster::extract(buffalo , sp.pts)  
+D.site$glw3_cattle <- raster::extract(cattle , sp.pts)
+D.site$glw3_chicken <- raster::extract(chicken, sp.pts)
+D.site$glw3_duck <- raster::extract(duck , sp.pts)
+D.site$glw3_horse <- raster::extract(horse , sp.pts)
+D.site$glw3_goat <- raster::extract(goat , sp.pts)
+D.site$glw3_pig <- raster::extract(pig , sp.pts)
+D.site$glw3_sheep <- raster::extract(sheep , sp.pts)
+
+
+###############
+# Human population density 
+
+#https://sedac.ciesin.columbia.edu/data/set/gpw-v4-population-density-rev11
+
+setwd(dir.gpw4)
+gpw4 <- raster("gpw_v4_population_density_rev10_2010_30_sec.tif")
+
+D.site$gpw4_humandensity <- raster::extract(gpw4 , sp.pts) 
+
+setwd(dir.stem)
+write.csv(D.site, file = "D.site.csv")
+
+
+## Join data tables (blood meal data and site-level environmental data)
+D.all <- left_join(D.blm, D.site, by ="site_ID")
+write.csv(D.all, file = "Data.all.csv")
