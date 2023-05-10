@@ -1,0 +1,364 @@
+
+library(tidyverse)
+library(rstan)
+library(rstanarm)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+parallel:::setDefaultClusterOptions(setup_strategy = "sequential")
+
+
+load("WSP_Blmeal_analysis_2.RData")
+
+
+nfocal <- length(sp.focal_name)
+npred <- length(pred_select)
+
+
+
+###########################
+## Estimate univariate effect sizes with glm()
+
+for(i in 1:npred){
+  for(j in 1:nfocal){
+    mod.formula <- paste0("cbind(n_human, (n_all - n_human)) ~ scale(", pred_select[i], ")")
+    mod.dat <- D.all[which(D.all$species_rev==sp.focal_name[j]), ]
+    est <- data.frame(
+      vector = sp.focal_name[j],
+      pred = pred_select[i],
+      coef = (summary(glm(mod.formula, family='binomial', data=mod.dat))$coefficients[2, "Estimate"]), 
+      p = (summary(glm(mod.formula, family='binomial', data=mod.dat))$coefficients[2, "Pr(>|z|)"]))
+    if(i==1&j==1){
+      UnivarEst_human <- est
+    }else{
+      UnivarEst_human <- rbind(UnivarEst_human, est)
+    }
+  }
+  for(j in 1:nfocal){
+    mod.formula <- paste0("cbind(n_wildlife, (n_all - n_wildlife)) ~ scale(", pred_select[i], ")")
+    mod.dat <- D.all[which(D.all$species_rev==sp.focal_name[j]), ]
+    est <- data.frame(
+      vector = sp.focal_name[j],
+      pred = pred_select[i],
+      coef = (summary(glm(mod.formula, family='binomial', data=mod.dat))$coefficients[2, "Estimate"]), 
+      p = (summary(glm(mod.formula, family='binomial', data=mod.dat))$coefficients[2, "Pr(>|z|)"]))
+    if(i==1&j==1){
+      UnivarEst_wildlife <- est
+    }else{
+      UnivarEst_wildlife <- rbind(UnivarEst_wildlife, est)
+    }
+  }  
+  for(j in 1:nfocal){
+    mod.formula <- paste0("cbind(n_wildlife, (n_all - n_wildlife)) ~ scale(", pred_select[i], ")")
+    mod.dat <- D.all[which(D.all$species_rev==sp.focal_name[j]), ]
+    est <- data.frame(
+      vector = sp.focal_name[j],
+      pred = pred_select[i],
+      coef = (summary(glm(mod.formula, family='binomial', data=mod.dat))$coefficients[2, "Estimate"]), 
+      p = (summary(glm(mod.formula, family='binomial', data=mod.dat))$coefficients[2, "Pr(>|z|)"]))
+    if(i==1&j==1){
+      UnivarEst_domest <- est
+    }else{
+      UnivarEst_domest <- rbind(UnivarEst_domest, est)
+    }
+  }   
+  }
+
+$sign <- ifelse(UnivarEst_human$p < 0.05, 1,0)  
+UnivarEst_wildlife$sign <- ifelse(UnivarEst_wildlife$p < 0.05, 1,0)  
+UnivarEst_domest$sign <- ifelse(UnivarEst_domest$p < 0.05, 1,0) 
+
+
+table(UnivarEst_human$pred, UnivarEst_human$sign)
+table(UnivarEst_wildlife$pred, UnivarEst_wildlife$sign)
+table(UnivarEst_domest$pred, UnivarEst_domest$sign)
+
+
+##################
+# Full Stan model
+
+# Function to generate data as required for Stan model
+make.dat_1sp.Pcov <- function(D, prednames, parspec, hostgroup){
+  # Matrix of scaled predictors
+  D.sel <- D %>% filter(species_rev==parspec)
+  
+    PredVar <- D.sel[, prednames]
+  for(i in 1:ncol(PredVar)){                     #scale variables
+    PredVar[,i] <- as.numeric(scale(PredVar[,i]))
+  }
+  colnames(PredVar) <- paste0("var_", 1:ncol(PredVar))
+
+  data_prop <-list(
+    N = dim(D.sel)[1],
+    P = ncol(PredVar),
+    n_focal = as.numeric(unlist(D.sel[, hostgroup])),
+    n_human = D.sel$human,
+    n_domestic = D.sel$n_domestic,
+    n_wildlife = D.sel$n_wildlife,
+    n_bird = D.sel$n_bird,   
+    n_chicken = D.sel$n_chicken,    
+    n_all = D.sel$no_tested,
+    obs_p = (as.numeric(unlist(D.sel[, hostgroup]))/ D.sel$no_tested),
+    cov_1 = as.numeric(PredVar$var_1),
+    cov_2 = as.numeric(PredVar$var_2),
+    cov_3 = as.numeric(PredVar$var_3),
+    cov_4 = as.numeric(PredVar$var_4),
+    cov_5 = as.numeric(PredVar$var_5),
+    cov_6 = as.numeric(PredVar$var_6),    
+    cov_7 = as.numeric(PredVar$var_7),  
+    cov_8 = as.numeric(PredVar$var_8),
+    cov_9 = as.numeric(PredVar$var_9),      
+    cov_8_obs = as.numeric(PredVar$var_8 [which(!is.na(PredVar$var_8))]),
+    cov_9_obs = as.numeric(PredVar$var_9 [which(!is.na(PredVar$var_9))]),
+    cov_10_obs = as.numeric(PredVar$var_10 [which(!is.na(PredVar$var_10))]),
+    
+    n_obs_cov_8 = length(which(!is.na(PredVar$var_8))),    
+    n_obs_cov_9 = length(which(!is.na(PredVar$var_9))),
+    n_obs_cov_10 = length(which(!is.na(PredVar$var_10))),
+    n_mis_cov_8 = length(which(is.na(PredVar$var_8))),
+    n_mis_cov_9 = length(which(is.na(PredVar$var_9))),
+    n_mis_cov_10 = length(which(is.na(PredVar$var_10))),    
+    
+    ii_obs_cov_8 = which(!is.na(PredVar$var_8)),
+    ii_obs_cov_9 = which(!is.na(PredVar$var_9)),
+    ii_obs_cov_10 = which(!is.na(PredVar$var_10)),
+    
+    ii_mis_cov_8 = as.array(which(is.na(PredVar$var_8))),
+    ii_mis_cov_9 = as.array(which(is.na(PredVar$var_9))),
+    ii_mis_cov_10 = as.array(which(is.na(PredVar$var_10))),
+    
+    scale_global = 1, # scale for the half -t prior for tau
+    nu_global = 1,    # degrees of freedom for the half -t prior for tau
+    nu_local = 1,     # degrees of freedom for the half -t priors for lambdas
+    slab_scale = 2,   # slab scale for the regularized horseshoe
+    slab_df = 4       # slab degrees of freedom for the regularized horseshoe
+    )
+  return(data_prop)
+}
+
+# Stan model with regularised horseshoe priors
+
+model_1sp_Pcov_regHS <- "data {
+  int<lower=1> N;                         // number sites
+  int<lower=1> P;                         // number of covariates
+  int<lower=0> n_focal[N];                // number of blood meals from focal species/group
+  int<lower=0> n_all[N];                  //  total number of blood meals
+  vector[N] obs_p;
+  int<lower=0> n_obs_cov_8;  
+  int<lower=0> n_obs_cov_9;
+  int<lower=0> n_obs_cov_10;  
+  int<lower=0> n_mis_cov_8;  
+  int<lower=0> n_mis_cov_9;  
+  int<lower=0> n_mis_cov_10;    
+  vector[N] cov_1;                       // covariate 1
+  vector[N] cov_2;                      
+  vector[N] cov_3; 
+  vector[N] cov_4; 
+  vector[N] cov_5; 
+  vector[N] cov_6;   
+  vector[N] cov_7; 
+
+  vector[n_obs_cov_8] cov_8_obs; 
+  vector[n_obs_cov_9] cov_9_obs;  
+  vector[n_obs_cov_10] cov_10_obs;   
+  int<lower=1, upper=N> ii_obs_cov_8[n_obs_cov_8];      
+  int<lower=1, upper=N> ii_obs_cov_9[n_obs_cov_9]; 
+  int<lower=1, upper=N> ii_obs_cov_10[n_obs_cov_10];   
+  int<lower=1, upper=N> ii_mis_cov_8[n_mis_cov_8];
+  int<lower=1, upper=N> ii_mis_cov_9[n_mis_cov_9];
+  int<lower=1, upper=N> ii_mis_cov_10[n_mis_cov_10];  
+}
+
+parameters {
+  vector[n_mis_cov_8] cov_8_mis;
+  vector[n_mis_cov_9] cov_9_mis;
+  vector[n_mis_cov_10] cov_10_mis;  
+  real<lower=-10, upper=10> mu;
+  real<lower=-10, upper=10> mu0;
+  real<lower=-10, upper=10> sigmaSite;
+  vector<lower=-10, upper=10>[N] muSite;
+  real<lower=-10, upper=10> beta[P];                // regression coefficients
+  real<lower=0> lambda[P];                           // local shrinkage parameter >0 for half-cauchy
+  real<lower=0> tau;   
+   real<lower=0> c_slap;    
+  // global shrinkage parameter >0 for half-cauchy
+  real<lower=0> sigma_tau;                               // species-level shrinkage parameter
+}
+
+transformed parameters {
+  vector[N] logit_phi;
+  vector[N] logit_theta;
+  real<lower=0> lambda_tilde[P];
+  vector[N] cov_8;
+  vector[N] cov_9;
+  vector[N] cov_10;  
+  // Fill Variables with sliced missing values 
+  cov_8[ii_obs_cov_8] = cov_8_obs;
+  cov_8[ii_mis_cov_8] = cov_8_mis;
+  cov_9[ii_obs_cov_9] = cov_9_obs;
+  cov_9[ii_mis_cov_9] = cov_9_mis;
+  cov_10[ii_obs_cov_10] = cov_10_obs;
+  cov_10[ii_mis_cov_10] = cov_10_mis;
+
+  // Local shrinkage with a slab with finite variance c^2
+  for(p in 1:P) {
+    lambda_tilde[p] = sqrt(c_slap^2 * square(lambda[p]) ./ (c_slap^2 + tau^2 * square(lambda[p])));
+  }
+
+  // Linear predictor
+  for(n in 1:N) {
+    logit_theta[n] = mu
+               + beta[1] * cov_1[n]
+               + beta[2] * cov_2[n]
+               + beta[3] * cov_3[n]
+               + beta[4] * cov_4[n]
+               + beta[5] * cov_5[n]
+               + beta[6] * cov_6[n]
+               + beta[7] * cov_7[n]             
+               + beta[8] * cov_8[n] 
+               + beta[9] * cov_9[n]
+               + beta[10] * cov_10[n];
+
+    logit_phi[n] = muSite[n];                
+  }
+}     
+
+model {
+  cov_8_mis ~ normal(0, 1);
+  cov_9_mis ~ normal(0, 1);
+  cov_10_mis ~ normal(0, 1);
+  mu ~ normal(0, 2);  
+  mu0 ~ normal(0, 2);
+  muSite ~ normal(mu0, sigmaSite);
+  sigmaSite ~ cauchy(0, 1);
+  c_slap ~ cauchy(0, 1);
+  sigma_tau ~ cauchy(0, 1);
+  tau ~ student_t(4, 0, sigma_tau); 
+  for(p in 1:P) {
+    lambda[p] ~ cauchy(0, 1);  
+    beta[p] ~ normal(0, tau * lambda_tilde[p]); 
+ 
+    to_vector(logit_phi) ~ normal(0, 2);
+  }
+
+  // Random covariates
+  n_focal ~ binomial(n_all, inv_logit(logit_theta));  // Likelihood
+  n_focal ~ binomial(n_all, inv_logit(logit_phi));
+}
+
+generated quantities {
+  //int<lower=0> nfocal_pp[N];               // posterior predicted number of infected individuals
+  vector[N] theta;
+  vector[N] phi;
+  vector[N] resid2;
+  real briersc;                             // Brier score
+  vector[N] resid2_0;
+  real briersc_0;                             // Brier score
+  int<lower=0, upper=1> mean_gt;
+  int<lower=0, upper=1> mean_gt_0;
+  phi = inv_logit(logit_phi);
+  theta = inv_logit(logit_theta);
+
+  resid2 = pow((obs_p - inv_logit(logit_theta)), 2);
+  briersc = sum(resid2)/N;
+  mean_gt = mean(theta) > mean(obs_p);
+  
+  resid2_0  = pow(obs_p - inv_logit(logit_phi), 2);
+  briersc_0 = sum(resid2_0)/N;
+  mean_gt_0 = mean(phi) > mean(obs_p);
+
+  //nfocal_pp = binomial_rng(n_all, inv_logit(logit_theta));
+}
+"
+## Save model as file
+cat(model_1sp_Pcov_regHS, file=(ModelCodeFull_prop <- tempfile()))
+
+
+#Fit full model
+iter = 20000
+
+sp.focal_name_short <- c("Aed-aeg", "Aed-alb", "Ano-fun", "Ano-gam", "Cul-pip", "Cul-qui")
+
+for(i in 1:nfocal){
+  dat <- make.dat_1sp.Pcov(D.all, pred_select, sp.focal_name[i], "n_human")
+  fit = stan(model_code = model_1sp_Pcov_regHS, data= dat, chains = 4, iter = iter, warmup = (iter-1000)) 
+  posterior <- as_draws_df(fit);
+  post_summary <- (summarise_draws(subset_draws(posterior, variable = c("beta", "mu", "briersc", "briersc_0", 'mean_gt', 'mean_gt_0'))))
+  post_summary$vector <- sp.focal_name_short[i]
+  post_summary$host <- "Human"
+
+  post_phi <- (summarise_draws(subset_draws(posterior, variable = c("phi", "sigmaSite"))))
+  post_phi$vector <- sp.focal_name_short[i]
+  post_phi$host <- "Human"   
+
+  save(fit, file =paste0("fit_human_", sp.focal_name[i], ".RData"))    
+    if(i==1){
+    PostSummary_all_human <- post_summary
+    PostPhi_all_human <- post_phi
+      }else{
+    PostSummary_all_human <- rbind(PostSummary_all_human, post_summary)
+    PostPhi_all_human <- rbind(PostPhi_all_human, post_phi)
+  }
+}
+PostSummary_all_human$effect <- NA
+PostSummary_all_human$effect[which(PostSummary_all_human$q5<0 & PostSummary_all_human$q95<0)] <- "neg"
+PostSummary_all_human$effect[which(PostSummary_all_human$q5>0 & PostSummary_all_human$q95>0)] <- "pos"
+PostSummary_all_human$effect[-grep("beta", PostSummary_all_human$variable)] <- NA
+save(PostSummary_all_human, file="PostSummary_all_human.RData")
+save( PostPhi_all_human, file=" PostPhi_all_human.RData")
+
+for(i in 1:nfocal){
+  dat <- make.dat_1sp.Pcov(D.all, pred_select, sp.focal_name[i], "n_wildlife")
+  fit = stan(model_code = model_1sp_Pcov_regHS, data= dat, chains = 4, iter = iter, warmup = (iter-1000)) 
+  posterior <- as_draws_df(fit);
+  post_summary <- (summarise_draws(subset_draws(posterior, variable = c("beta", "mu", "briersc", "briersc_0", 'mean_gt', 'mean_gt_0'))))
+  post_summary$vector <- sp.focal_name_short[i]
+  post_summary$host <- "Wildlife"
+  
+  post_phi <- (summarise_draws(subset_draws(posterior, variable = c("phi", "sigmaSite", "mu0"))))
+  post_phi$vector <- sp.focal_name_short[i]
+  post_phi$host <- "Wildlife"   
+  
+  save(fit, file =paste0("fit_wildlife_", sp.focal_name[i], ".RData"))    
+  if(i==1){
+    PostSummary_all_wildlife <- post_summary
+    PostPhi_all_wildlife <- post_phi
+  }else{
+    PostSummary_all_wildlife <- rbind(PostSummary_all_wildlife, post_summary)
+    PostPhi_all_wildlife <- rbind(PostPhi_all_wildlife, post_phi)
+  }
+}
+PostSummary_all_wildlife$effect <- NA
+PostSummary_all_wildlife$effect[which(PostSummary_all_wildlife$q5<0 & PostSummary_all_wildlife$q95<0)] <- "neg"
+PostSummary_all_wildlife$effect[which(PostSummary_all_wildlife$q5>0 & PostSummary_all_wildlife$q95>0)] <- "pos"
+PostSummary_all_wildlife$effect[-grep("beta", PostSummary_all_wildlife$variable)] <- NA
+save(PostSummary_all_wildlife, file="PostSummary_all_wildlife.RData")
+save( PostPhi_all_wildlife, file=" PostPhi_all_wildlife.RData")
+
+for(i in 1:nfocal){
+  dat <- make.dat_1sp.Pcov(D.all, pred_select, sp.focal_name[i], "n_domestic")
+  fit = stan(model_code = model_1sp_Pcov_regHS, data= dat, chains = 4, iter = iter, warmup = (iter-1000)) 
+  posterior <- as_draws_df(fit);
+  post_summary <- (summarise_draws(subset_draws(posterior, variable = c("beta", "mu", "briersc", "briersc_0", 'mean_gt', 'mean_gt_0'))))
+  post_summary$vector <- sp.focal_name_short[i]
+  post_summary$host <- "Domestic"
+  
+  post_phi <- (summarise_draws(subset_draws(posterior, variable = c("phi", "sigmaSite"))))
+  post_phi$vector <- sp.focal_name_short[i]
+  post_phi$host <- "Domestic"   
+  
+  save(fit, file =paste0("fit_domestic_", sp.focal_name[i], ".RData"))    
+  if(i==1){
+    PostSummary_all_domestic <- post_summary
+    PostPhi_all_domestic <- post_phi
+  }else{
+    PostSummary_all_domestic <- rbind(PostSummary_all_domestic, post_summary)
+    PostPhi_all_domestic <- rbind(PostPhi_all_domestic, post_phi)
+  }
+}
+PostSummary_all_domestic$effect <- NA
+PostSummary_all_domestic$effect[which(PostSummary_all_domestic$q5<0 & PostSummary_all_domestic$q95<0)] <- "neg"
+PostSummary_all_domestic$effect[which(PostSummary_all_domestic$q5>0 & PostSummary_all_domestic$q95>0)] <- "pos"
+PostSummary_all_domestic$effect[-grep("beta", PostSummary_all_domestic$variable)] <- NA
+save(PostSummary_all_domestic, file="PostSummary_all_domestic.RData")
+save(PostPhi_all_domestic, file="PostPhi_all_domestic.RData")
