@@ -1,0 +1,114 @@
+
+library(tidyverse)
+library(tidyselect)
+library(ggplot2)
+library(raster)
+library(sp)
+library(rgeos)
+library(sf)
+library(geosphere)
+library(corrplot)
+library(loo)
+library(projpred)
+library(vegan)
+
+
+SEED=20202020
+
+# World map
+library(rnaturalearth)
+worldmap <- ne_countries(scale = "medium", type = "countries", returnclass = "sf")[1]
+
+
+sp.focal_name <- sort(c("Aedes_aegypti", "Aedes_albopictus", "Anopheles_funestus", "Anopheles_gambiae", "Culex_pipiens", "Culex_quinquefasciatus"))
+
+
+
+
+# Load data file of all merged data
+D.all <- read_csv("Data.all_230122.csv", col_names = TRUE)
+
+# Filter focal species
+D.all <- filter(D.all, species_rev  %in% sp.focal_name)
+
+sort(table(D.all$species_rev))
+
+# Merge some selected livestock
+D.all$glw3_sheep.goat <- D.all$glw3_goat + D.all$glw3_sheep 
+D.all$glw3_cattle2 <- D.all$glw3_buffalo + D.all$glw3_cattle
+D.all$glw3_ruminant <- D.all$glw3_goat + D.all$glw3_sheep + D.all$glw3_buffalo + D.all$glw3_cattle
+D.all$glw3_poultry <- D.all$glw3_chicken + D.all$glw3_duck 
+
+plot_studysites <- ggplot(worldmap) + geom_sf() + geom_point(data = D.all, aes(x = long, y = lat), size = 0.8, shape = 19, col = "darkred")
+ggsave(file="plot_studysites.tiff", plot=plot_studysites, dpi=300, width = 3.307*2, height = 3.307*2, units = 'in')
+
+pred_all <- c("bio1", "bio12", "bio14", "bio15", "elevation", 
+                "prop_cropland", "prop_water", "prop_urban", "prop_grassland", "prop_treecover", "prop_shrubland", "NDVI.mean", "NDVI.SD", "gpw4_humandensity",
+                "glw3_buffalo", "glw3_cattle", "glw3_goat", "glw3_horse",  "glw3_pig", "glw3_chicken", "glw3_duck",  "glw3_cattle2", "glw3_sheep.goat", "glw3_ruminant", "glw3_poultry")
+
+## Scale predictor variables
+for(i in match(pred_names, names(D.all))){
+  D.all[,i] <- as.numeric(scale(D.all[,i]))
+}
+
+## PCA of predictor variable relationships
+PredVar_all <- D.all[, c("study_ID.x", pred_all)]
+PredVar_all <- distinct(PredVar_all, study_ID.x, .keep_all = TRUE)
+PredVar_all <- PredVar_all[, pred_all]    
+PredVar_all <- scale(PredVar_all)
+PredVar_all[is.na(PredVar_all)] <- 0
+
+RDA_Predvar <- rda(PredVar_all)
+biplot(RDA_Predvar)
+
+## Plot correlation among predictor variables
+pred0 <- D.all[, pred_all]
+pred0[is.na(pred0)] <- 0
+plot_corr_pred.all <- corrplot::corrplot(cor(pred0))
+
+# Check for the number of sites with livestock in order to select species
+sum(D.all$bovine>0); sum(D.all$horse>0); sum(D.all$chicken>0); sum(D.all$pig>0)
+
+
+pred_select <- c("lat", "bio1", "bio12", "bio14", "prop_treecover", "prop_cropland", "prop_water",  "gpw4_humandensity", 
+                 "glw3_ruminant", "glw3_poultry")
+
+predsel <- D.all[, pred_select]
+predsel[is.na(predsel)] <- 0
+plot_corr_pred.sel <- corrplot::corrplot(cor(predsel))
+
+jpeg(file ="plot_corr_pred.all.jpeg"); corrplot::corrplot(cor(pred0)); dev.off()
+jpeg(file ="plot_corr_pred.sel.jpeg"); corrplot::corrplot(cor(predsel)); dev.off()
+
+
+
+# Assign all host species to host groups ("human", "domestic", wildlife")
+host_domestic <- c("goat", "cat", "dog", "donkey", "horse", "sheep", "pig", "bovine")
+
+host_wildlife <- c("wolf" ,"jackle", "fox", "coyote", "hedge_hog", "possum", "racoon", "deer", "weasel", "mink", "squirrel",           
+                   "chipmunk", "capybara", "rodent", "vole", "mouse", "rat", "bat", "procupine", "marsupial", "otter", "armadillo", 
+                   "rabbit", "hippo", "monkey", "lemur", "chimpanze", "tarsier", "skunk", "hyrax")            
+
+host_bird <- c("bird", "pigeon")              
+host_chicken <- "chicken"
+host_amph<- c("frog" ,"toad" ,"salamander" ,"reptile" ,"amphibian", "fish")
+host_misc <- c("zoo_animals", "no_human_mammal")
+
+
+D.all$n_domestic <- rowSums(D.all[, host_domestic])
+D.all$n_wildlife <- rowSums(D.all[, host_wildlife])
+D.all$n_bird <- rowSums(D.all[, host_bird])
+D.all$n_chicken <- rowSums(D.all[, host_chicken])
+D.all$n_amph <- rowSums(D.all[, host_amph])
+D.all$n_misc <- rowSums(D.all[, host_misc])
+D.all$n_human <- D.all$human
+D.all$n_all <- D.all$no_tested
+
+(D.all$n_domestic + D.all$n_wildlife + D.all$n_human + D.all$n_bird + D.all$n_chicken + D.all$n_amph + D.all$n_misc)/(D.all$n_all)
+sort((D.all$n_domestic + D.all$n_wildlife + D.all$n_human)/(D.all$n_all))
+
+feedgroups <- c("n_human", "n_domestic", "n_wildlife", "n_bird", "n_chicken", "n_amph", "n_misc")
+feedgroups_focal <- c("n_human", "n_domestic", "n_wildlife", "n_bird", "n_chicken")
+
+nfocal <- length(feedgroups_focal)
+npred <- length(pred_select)
