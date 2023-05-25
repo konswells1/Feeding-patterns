@@ -1,0 +1,308 @@
+#########################
+# Dirichlet regression in brms/Stan
+
+
+library(brms)
+library(cmdstanr)
+library(dplyr)
+
+# Simulate data
+N <- 20
+df <- data.frame(
+  x1 = rnorm(N),
+  x2 = rnorm(N),
+  x3 = rnorm(N)) %>%
+  # Simulate underlying feeding probabilities for focal categories
+  # 1st categorry is baseline
+  mutate(
+    true_proby2 = plogis(-0.7 - 0.3 * x1),
+    true_proby3 = plogis(-1.2 + 0.7 * x1),
+    true_proby4 = plogis(-1.5 - 0.7 * x3)) %>%
+  # Simulate observed counts for the focal categories
+  mutate(
+    y2 = rbinom(20, 50, prob = true_proby2),
+    y3 = rbinom(20, 50, prob = true_proby3),
+    y4 = rbinom(20, 50, prob = true_proby4)) %>%
+  # Counts for the 'other' category are the leftovers;
+  # note that must have at least one count in the other category for brms model
+  rowwise() %>%
+  mutate(y1 = max(1, 50 - (y2 + y3 + y4))) %>%
+  # Calculate observed proportions for the three categories
+  mutate(size = y1 + y2 + y3 + y4,
+         py1 = y1 / size,
+         py2 = y2 / size,
+         py3 = y3 / size,
+         py4 = y4 / size)
+
+# Introduce missing values
+df$x3[sample(N, 3)] <- NA
+
+
+bind <- function(...) cbind(...)
+make_stancode(bind(py1, py2, py3, py4) ~ x1, df, dirichlet())
+  
+# Ensure results are sensible when using raw proportions in a
+# Dirichlet regression
+fit <- brm(bind(py1, py2, py3, py4) ~ x1, df, dirichlet(),
+           backend = 'cmdstanr')
+summary(fit)
+
+# Hierarchical joint Dirichlet and Binomial model for count data
+stan_data <- list(N = NROW(df),
+                  nSample = df$size,
+                  C = 4,
+                  n1 = df$y2,
+                  n2 = df$y3,
+                  n3 = df$y4,
+                  n4 = df$y1,
+                  K = 3,
+                  x1 = df$x1,
+                  x2 = df$x2,
+                  x3_obs = as.numeric(na.omit(df$x3)),
+                  nobs_x3 = length(which(!is.na(df$x3))), 
+                  nmis_x3 = length(which(is.na(df$x3))),                   
+                  ii_obs_x3 = which(!is.na(df$x3)),
+                  ii_mis_x3 = which(is.na(df$x3))
+                  ##X = matrix(c(df$x1, df$x2, df$x3), nrow=N),
+                  )                              
+
+model_code <-
+  'data {
+  int<lower=0> N; // number of sites
+  int<lower=0> C; // number of categories
+  int<lower=0> nSample[N]; // number of mosquitos sampled per site
+  int<lower=0> n1[N]; // number of human bloodmeals per site
+  int<lower=0> n2[N]; // number of domestic bloodmeals per site
+  int<lower=0> n3[N]; // number of wildlife bloodmeals per site
+  int<lower=1> K;  // number of predictors
+  vector[N] x1; 
+  vector[N] x2; 
+  int<lower=0> nobs_x3; 
+  int<lower=0> nmis_x3; 
+  vector[nobs_x3] x3_obs;
+  int<lower=1, upper=N> ii_obs_x3[nobs_x3];
+  int<lower=1, upper=N> ii_mis_x3[nmis_x3];
+}
+
+parameters{
+  // Imputed predictor values
+  vector[nmis_x3] x3_mis;
+
+  // sum-to-1 constraint for feeding proportions
+  simplex[C] theta[N];
+ 
+  // Dirichlet precision parameter
+  real<lower=0> phi;
+ 
+  // intercepts for the two categories of interest
+  vector[(C-1)] alpha;
+ 
+  // regression coefficients for the two categories of interest
+  vector[K] beta_1;
+  vector[K] beta_2;
+  vector[K] beta_3; 
+}
+
+transformed parameters {
+  // Fill Variables with sliced missing values
+  vector[N] x3;
+  x3[ii_obs_x3] = x3_obs;
+  x3[ii_mis_x3] = x3_mis;
+
+  // Predictor matrix  
+  matrix[N, K] X;
+  for(n in 1:N){
+    X[n,1] = x1[n];
+    X[n,2] = x2[n];
+    X[n,3] = x3[n];
+  }
+}
+
+model {
+ // Impute missing values
+  x3_mis ~ normal(0, 1);
+ // Dirichlet precision parameter
+ phi ~ gamma(0.01, 0.01);
+ // intercepts
+ alpha ~ normal(0, 1);
+ // regression coefficients;
+ beta_1 ~ normal(0, 1);
+ beta_2 ~ normal(0, 1);
+ beta_3 ~ normal(0, 1); 
+ 
+ // initialize linear predictor terms
+ vector[N] mu_1 = rep_vector(0.0, N);
+ vector[N] mu_2 = rep_vector(0.0, N);
+ vector[N] mu_3 = rep_vector(0.0, N);
+ // logit-linear predictor matrix
+ vector[3] mu[N];
+ mu_1 += to_vector(alpha[1] + X * beta_1);
+ mu_2 += to_vector(alpha[2] +  X * beta_2);
+ mu_3 += to_vector(alpha[3] + X * beta_3);
+ for(i in 1:N){
+   mu[i] = transpose([0, mu_1[i], mu_2[i], mu_3[i]]);
+   theta[i] ~ dirichlet(softmax(mu[i]) * phi);
+ }
+ 
+ // binomial likelihood functions
+ for (i in 1:N){
+  n1[i] ~ binomial(nSample[i], theta[i, 2]);
+  n2[i] ~ binomial(nSample[i], theta[i, 3]);
+  n3[i] ~ binomial(nSample[i], theta[i, 4]);  
+ }
+}'
+
+
+# Compile the above code into c++ for model execution
+cmd_mod <- cmdstan_model(write_stan_file(model_code),
+                         stanc_options = list('canonicalize=deprecations,braces,parentheses'))
+fit <- cmd_mod$sample(data = stan_data,
+                      chains = 4,
+                      parallel_chains = 4,
+                      refresh = 500)
+
+# Check diagnostics
+fit$diagnostic_summary()
+
+# Inspect parameter estimates
+library(bayesplot)
+mcmc_hist(fit$draws("alpha"))
+mcmc_trace(fit$draws("alpha"))
+
+mcmc_hist(fit$draws("beta_1"))
+mcmc_trace(fit$draws("beta_1"))
+
+mcmc_hist(fit$draws("phi"))
+mcmc_trace(fit$draws("phi"))
+
+
+
+####################
+# Repeat model with RHS prior
+
+model_code_RHS <-
+'data {
+  int<lower=0> N; // number of sites
+  int<lower=0> C; // number of categories
+  int<lower=0> nSample[N]; // number of mosquitos sampled per site
+  int<lower=0> n1[N]; // number of human bloodmeals per site
+  int<lower=0> n2[N]; // number of domestic bloodmeals per site
+  int<lower=0> n3[N]; // number of wildlife bloodmeals per site
+  int<lower=1> K;  // number of predictors
+  vector[N] x1; 
+  vector[N] x2; 
+  int<lower=0> nobs_x3; 
+  int<lower=0> nmis_x3; 
+  vector[nobs_x3] x3_obs;
+  int<lower=1, upper=N> ii_obs_x3[nobs_x3];
+  int<lower=1, upper=N> ii_mis_x3[nmis_x3];
+}
+
+parameters{
+  // Imputed predictor values
+  vector[nmis_x3] x3_mis;
+  // sum-to-1 constraint for feeding proportions
+  simplex[C] theta[N];
+  // Dirichlet precision parameter
+  real<lower=0> phi;
+  // intercepts for the two categories of interest
+  vector[(C-1)] alpha;
+  // regression coefficients for the two categories of interest
+  vector[K] beta_1;
+  vector[K] beta_2;
+  vector[K] beta_3; 
+  // precision paramters 
+  vector<lower=0>[K] lambda_1;    
+  vector<lower=0>[K] lambda_2;
+  vector<lower=0>[K] lambda_3;
+  real<lower=0> c_slap[(C-1)]; 
+  real<lower=0> tau;
+  real<lower=0> sigma_tau;
+}
+
+transformed parameters {
+  // Fill Variables with sliced missing values
+  vector[N] x3;
+  x3[ii_obs_x3] = x3_obs;
+  x3[ii_mis_x3] = x3_mis;
+  // Predictor matrix  
+  matrix[N, K] X;
+  for(n in 1:N){
+    X[n,1] = x1[n];
+    X[n,2] = x2[n];
+    X[n,3] = x3[n];
+  }
+
+  // lambda_tilde for RHS priors
+  vector<lower=0>[K] lambda_tilde_1;
+  vector<lower=0>[K] lambda_tilde_2;
+  vector<lower=0>[K] lambda_tilde_3;
+  for(i in 1:K){
+    lambda_tilde_1[i] = sqrt(c_slap[1]^2 * square(lambda_1[i]) ./ (c_slap[1]^2 + tau^2 * square(lambda_1[i])));
+    lambda_tilde_2[i] = sqrt(c_slap[2]^2 * square(lambda_2[i]) ./ (c_slap[2]^2 + tau^2 * square(lambda_2[i])));
+    lambda_tilde_3[i] = sqrt(c_slap[3]^2 * square(lambda_3[i]) ./ (c_slap[3]^2 + tau^2 * square(lambda_3[i])));      
+  }  
+}
+
+model {
+  // Impute missing values
+  x3_mis ~ normal(0, 1);
+  // Dirichlet precision parameter
+  phi ~ gamma(0.01, 0.01);
+  // intercepts
+  alpha ~ normal(0, 1);
+  // Coefficients with RHS prior
+  sigma_tau ~ gamma(1, 1);
+  tau ~ cauchy(0, sigma_tau);
+  c_slap ~ cauchy(0, 1);
+  lambda_1 ~ cauchy(0, 2.5);
+  lambda_2 ~ cauchy(0, 2.5);  
+  lambda_3 ~ cauchy(0, 2.5);
+  beta_1 ~ normal(0, tau * lambda_tilde_1);
+  beta_2 ~ normal(0, tau * lambda_tilde_2); 
+  beta_3 ~ normal(0, tau * lambda_tilde_3);
+ 
+ // initialize linear predictor terms
+ vector[N] mu_1 = rep_vector(0.0, N);
+ vector[N] mu_2 = rep_vector(0.0, N);
+ vector[N] mu_3 = rep_vector(0.0, N);
+ 
+ // logit-linear predictor matrix
+ vector[3] mu[N];
+ mu_1 += to_vector(alpha[1] + X * beta_1);
+ mu_2 += to_vector(alpha[2] +  X * beta_2);
+ mu_3 += to_vector(alpha[3] + X * beta_3);
+ for(i in 1:N){
+   mu[i] = transpose([0, mu_1[i], mu_2[i], mu_3[i]]);
+   theta[i] ~ dirichlet(softmax(mu[i]) * phi);
+ }
+ 
+ // binomial likelihood functions
+ for (i in 1:N){
+  n1[i] ~ binomial(nSample[i], theta[i, 2]);
+  n2[i] ~ binomial(nSample[i], theta[i, 3]);
+  n3[i] ~ binomial(nSample[i], theta[i, 4]);  
+ }
+}'
+
+# Compile the above code into c++ for model execution
+cmd_mod_RHS <- cmdstan_model(write_stan_file(model_code_RHS),
+                         stanc_options = list('canonicalize=deprecations,braces,parentheses'))
+fit_RHS <- cmd_mod_RHS$sample(data = stan_data,
+                      chains = 4,
+                      parallel_chains = 4,
+                      refresh = 500)
+
+# Check diagnostics
+fit_RHS$diagnostic_summary()
+
+# Inspect parameter estimates
+library(bayesplot)
+mcmc_hist(fit_RHS$draws("alpha"))
+mcmc_trace(fit_RHS$draws("alpha"))
+
+mcmc_hist(fit_RHS$draws("beta_1"))
+mcmc_trace(fit_RHS$draws("beta_1"))
+
+mcmc_hist(fit$draws("phi"))
+mcmc_trace(fit$draws("phi"))
