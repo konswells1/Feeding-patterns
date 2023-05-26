@@ -19,11 +19,7 @@ SEED=20202020
 library(rnaturalearth)
 worldmap <- ne_countries(scale = "medium", type = "countries", returnclass = "sf")[1]
 
-
 sp.focal_name <- sort(c("Aedes_aegypti", "Aedes_albopictus", "Anopheles_funestus", "Anopheles_gambiae", "Culex_pipiens", "Culex_quinquefasciatus"))
-
-
-
 
 # Load data file of all merged data
 D.all <- read_csv("Data.all_230122.csv", col_names = TRUE)
