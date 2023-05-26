@@ -1,0 +1,261 @@
+library(brms)
+library(cmdstanr)
+library(dplyr)
+library(tidyverse)
+library(bayesplot)
+library(posterior)
+library(ggplot2)
+
+make.dat <- function(D, prednames, parspec){
+  # Matrix of scaled predictors
+  D.sel <- D %>% filter(species_rev==parspec)
+  
+  PredVar <- D.sel[, prednames]
+  for(i in 1:ncol(PredVar)){                     #scale variables
+    PredVar[,i] <- as.numeric(scale(PredVar[,i]))
+  }
+  colnames(PredVar) <- paste0("x", 1:ncol(PredVar))
+  data <-list(
+    N = dim(D.sel)[1],
+    K = ncol(PredVar),
+    C = 4,    # number of host groups
+    nSample = D.sel$no_tested, 
+    nhuman = D.sel$n_human,
+    ndomestic = D.sel$n_domestic,
+    nwildlife = D.sel$n_wildlife,
+    nother = D.sel$n_others,   
+    x1 = as.numeric(PredVar$x1),
+    x2 = as.numeric(PredVar$x2),
+    x3 = as.numeric(PredVar$x3),
+    x4 = as.numeric(PredVar$x4),
+    x5 = as.numeric(PredVar$x5),
+    x6 = as.numeric(PredVar$x6),    
+    x7 = as.numeric(PredVar$x7),  
+    x8_obs = as.numeric(PredVar$x8 [which(!is.na(PredVar$x8))]),
+    x9_obs = as.numeric(PredVar$x9 [which(!is.na(PredVar$x9))]),
+    x10_obs = as.numeric(PredVar$x10 [which(!is.na(PredVar$x10))]),
+    
+    nobs_x8 = length(which(!is.na(PredVar$x8))),    
+    nobs_x9 = length(which(!is.na(PredVar$x9))),
+    nobs_x10 = length(which(!is.na(PredVar$x10))),
+    nmis_x8 = length(which(is.na(PredVar$x8))),
+    nmis_x9 = length(which(is.na(PredVar$x9))),
+    nmis_x10 = length(which(is.na(PredVar$x10))),    
+    
+    ii_obs_x8 = which(!is.na(PredVar$x8)),
+    ii_obs_x9 = which(!is.na(PredVar$x9)),
+    ii_obs_x10 = which(!is.na(PredVar$x10)),
+    
+    ii_mis_x8 = as.array(which(is.na(PredVar$x8))),
+    ii_mis_x9 = as.array(which(is.na(PredVar$x9))),
+    ii_mis_x10 = as.array(which(is.na(PredVar$x10)))
+  )
+  return(data)
+}
+
+model_code <-
+  'data {
+  int<lower=0> N; // number of sites
+  int<lower=2> C; // number of categories
+  array[N] int<lower=0> nSample; // number of mosquitos sampled per site
+  array[N] int<lower=0> nhuman; // number of human bloodmeals per site
+  array[N] int<lower=0> ndomestic; // number of domestic bloodmeals per site
+  array[N] int<lower=0> nwildlife; // number of wildlife bloodmeals per site
+  int<lower=1> K;  // number of predictors
+  vector[N] x1; 
+  vector[N] x2; 
+  vector[N] x3; 
+  vector[N] x4; 
+  vector[N] x5; 
+  vector[N] x6; 
+  vector[N] x7; 
+  int<lower=0> nobs_x8; 
+  int<lower=0> nmis_x8; 
+  vector[nobs_x8] x8_obs;
+  array[nobs_x8] int<lower=1, upper=N> ii_obs_x8;
+  array[nmis_x8] int<lower=1, upper=N> ii_mis_x8;
+  int<lower=0> nobs_x9; 
+  int<lower=0> nmis_x9; 
+  vector[nobs_x9] x9_obs;
+  array[nobs_x9] int<lower=1, upper=N> ii_obs_x9;
+  array[nmis_x9] int<lower=1, upper=N> ii_mis_x9;
+  int<lower=0> nobs_x10; 
+  int<lower=0> nmis_x10; 
+  vector[nobs_x10] x10_obs;
+  array[nobs_x10] int<lower=1, upper=N> ii_obs_x10;
+  array[nmis_x10] int<lower=1, upper=N> ii_mis_x10;
+}
+
+parameters{
+  // Imputed predictor values
+  vector[nmis_x8] x8_mis;
+  vector[nmis_x9] x9_mis;  
+  vector[nmis_x10] x10_mis;  
+ // sum-to-1 constraint for feeding proportions
+ simplex[C] theta[N];
+ // Dirichlet precision parameter
+ real<lower=0> phi;
+ // intercepts for the categories of interest
+ vector[(C-1)] alpha;
+ // regression coefficients for the two categories of interest
+ vector[K] beta_human;
+ vector[K] beta_domestic; 
+ vector[K] beta_wildlife;
+ 
+  // precision paramters 
+  vector<lower=0>[K] lambda_1;    
+  vector<lower=0>[K] lambda_2;
+  vector<lower=0>[K] lambda_3;
+  real<lower=0> c_slap; 
+  real<lower=0> tau;
+  real<lower=0> sigma_tau;
+}
+
+transformed parameters {
+  // Fill Variables with sliced missing values
+  vector[N] x8;
+  x8[ii_obs_x8] = x8_obs;
+  x8[ii_mis_x8] = x8_mis;
+  vector[N] x9;
+  x9[ii_obs_x9] = x9_obs;
+  x9[ii_mis_x9] = x9_mis;
+  vector[N] x10;
+  x10[ii_obs_x10] = x10_obs;
+  x10[ii_mis_x10] = x10_mis;
+  
+  // Predictor matrix  
+  matrix[N, K] X;
+  for(n in 1:N){
+    X[n,1] = x1[n];
+    X[n,2] = x2[n];
+    X[n,3] = x3[n];
+    X[n,4] = x4[n];
+    X[n,5] = x5[n];
+    X[n,6] = x6[n]; 
+    X[n,7] = x7[n];
+    X[n,8] = x8[n];
+    X[n,9] = x9[n];
+    X[n,10] = x10[n];    
+  }
+
+  // lambda_tilde for RHS priors
+  vector<lower=0>[K] lambda_tilde_1;
+  vector<lower=0>[K] lambda_tilde_2;
+  vector<lower=0>[K] lambda_tilde_3;
+  for(i in 1:K){
+    lambda_tilde_1[i] = sqrt(c_slap^2 * square(lambda_1[i]) ./ (c_slap^2 + tau^2 * square(lambda_1[i])));
+    lambda_tilde_2[i] = sqrt(c_slap^2 * square(lambda_2[i]) ./ (c_slap^2 + tau^2 * square(lambda_2[i])));
+    lambda_tilde_3[i] = sqrt(c_slap^2 * square(lambda_3[i]) ./ (c_slap^2 + tau^2 * square(lambda_3[i])));      
+  }
+}
+
+model {
+ // Impute missing values
+  x8_mis ~ normal(0, 1);
+  x9_mis ~ normal(0, 1);
+  x10_mis ~ normal(0, 1);  
+
+  // Dirichlet precision parameter
+  phi ~ gamma(0.01, 0.01);
+
+  // intercepts
+  alpha ~ normal(0, 2);
+
+  // Coefficients if choosing RHS prior
+  sigma_tau ~ gamma(1, 1);
+  tau ~ student_t(1,0,sigma_tau);
+  c_slap ~ student_t(4,0,2);
+  lambda_1 ~ student_t(1,0,2);
+  lambda_2 ~ student_t(1,0,2);  
+  lambda_3 ~ student_t(1,0,2);
+  //beta_human ~ normal(0, tau * lambda_tilde_1);
+  //beta_domestic ~ normal(0, tau * lambda_tilde_2); 
+  //beta_wildlife ~ normal(0, tau * lambda_tilde_3);
+
+  // Coefficients if choosing student_t or normal(0, 1) prior
+  beta_human ~ normal(0, 1); //student_t(3,0,1);
+  beta_domestic ~ normal(0, 1); //student_t(3,0,1);
+  beta_wildlife ~ normal(0, 1); //student_t(3,0,1);
+
+  // initialize linear predictor terms
+  vector[N] mu_human = rep_vector(0.0, N);
+  vector[N] mu_domestic = rep_vector(0.0, N);
+  vector[N] mu_wildlife = rep_vector(0.0, N);
+
+  // logit-linear predictor matrix
+  vector[C] mu[N];
+  mu_human += to_vector(alpha[1] + X * beta_human);
+  mu_domestic += to_vector(alpha[2] +  X * beta_domestic);
+  mu_wildlife += to_vector(alpha[3] + X * beta_wildlife);
+  for(i in 1:N){
+    mu[i] = transpose([0, mu_human[i], mu_domestic[i], mu_wildlife[i]]);
+    theta[i] ~ dirichlet(softmax(mu[i]) * phi);
+  }
+  // binomial likelihood functions
+  for (i in 1:N){
+    nhuman[i] ~ binomial(nSample[i], theta[i, 2]);
+    ndomestic[i] ~ binomial(nSample[i], theta[i, 3]);
+    nwildlife[i] ~ binomial(nSample[i], theta[i, 4]);  
+  }
+} 
+generated quantities {
+  // population-level estimate of theta
+  vector[C] muPop;
+  muPop = transpose([0, alpha[1], alpha[2], alpha[3]]);
+  simplex[C] theta_Pop;
+  theta_Pop = dirichlet_rng(softmax(muPop) * phi);
+  
+  // Residuals 
+  vector[N] resid_human;
+  vector[N] resid_domestic;
+  vector[N] resid_wildlife;
+  real briersc_human;
+  real briersc_domestic;
+  real briersc_wildlife;
+
+  for (i in 1:N){
+    resid_human[i] = pow(( (nhuman[i]*1.0/nSample[i]) - theta[i,2]), 2);
+    resid_domestic[i] = pow(( (ndomestic[i]*1.0/nSample[i]) - theta[i,3]), 2);
+    resid_wildlife[i] = pow(( (nwildlife[i]*1.0/nSample[i]) - theta[i,4]), 2);
+  }
+  briersc_human = sum(resid_human)/N;
+  briersc_domestic = sum(resid_domestic)/N;
+  briersc_wildlife = sum(resid_wildlife)/N; 
+}'
+
+####################
+# Run model for all species to save output
+
+sp.focal_name_short <- c("Aed. aegypti", "Aed. albopictus", "An. funestus", "An. gambiae", "Cx. pipiens", "Cx. quinquefasciatus")
+
+for(i in 1:nfocal){
+  stan_data <- make.dat(D.all, pred_select, sp.focal_name[i])
+  fit <- cmd_mod$sample(data = stan_data, chains = 4, iter_warmup = 10000, parallel_chains = 4, refresh = 500)
+  posterior <- as_draws_df(fit);
+  posterior <- as_draws_df(fit);
+  
+  post_beta <- (summarise_draws(subset_draws(posterior, variable = c("beta_human", "beta_domestic", "beta_wildlife"))))
+  post_beta <- post_beta %>% mutate(host = c(rep("Human", npred), rep("Domestic", npred), rep("Wildlife",  npred))) 
+  post_theta_Pop <- (summarise_draws(subset_draws(posterior, variable = c("theta_Pop"))))
+  post_theta_Pop <- post_theta_Pop %>% mutate(host = c("Others", "Human", "Domestic", "Wildlife"))
+  post_briersc <- (summarise_draws(subset_draws(posterior, variable = c("briersc_human", "briersc_domestic", "briersc_wildlife"))))  
+  post_briersc <- post_briersc %>% mutate(host = c("Human", "Domestic", "Wildlife"))
+  post_summary <- rbind(post_beta, post_theta_Pop, post_briersc)
+  post_summary$vector <- sp.focal_name_short[i]  
+  post_summary <- post_summary %>%
+    mutate(effect = ifelse(q5<0&q95<0, "neg", NA),
+           effect = ifelse(q5>0&q95>0, "pos", effect))
+  
+  post_theta <- (summarise_draws(subset_draws(posterior, variable = c("theta"))))
+  post_theta <- post_theta %>% mutate(host = c(rep("Others", stan_data$N), rep("Human", stan_data$N), rep("Domestic", stan_data$N), rep("Wildlife", stan_data$N)))
+  post_theta$vector <- sp.focal_name_short[i]
+  
+  save(fit, file =paste0("fit_", sp.focal_name[i], ".RData"))    
+  if(i==1){
+    PostSummary_all <- post_summary
+    PostTheta_all <- post_theta
+  }else{
+    PostSummary_all <- rbind(PostSummary_all, post_summary)
+    PostTheta_all <- rbind(PostTheta_all, post_theta)
+  }
+}
